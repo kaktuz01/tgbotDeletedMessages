@@ -11,7 +11,7 @@
   `/deleted <chat_id>` — все удалённые сообщения чата
 
 ## Запуск
-1. Создайте бота у @BotFather, в его настройках включите **Business Mode** (Bot Settings → Business Mode).
+1. Создайте бота у @BotFather, в его настройках включите **Secretary Mode** (в старых версиях BotFather — Business Mode).
 2. `cp .env.example .env` и впишите `BOT_TOKEN`.
 3. ```
    python -m venv .venv && source .venv/bin/activate
