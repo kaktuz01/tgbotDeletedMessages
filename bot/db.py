@@ -30,7 +30,23 @@ CREATE TABLE IF NOT EXISTS edits (
     old_text TEXT,
     edited_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (
+    user_id INTEGER PRIMARY KEY,
+    notify_deleted INTEGER NOT NULL DEFAULT 1,
+    notify_edited INTEGER NOT NULL DEFAULT 1,
+    notify_own INTEGER NOT NULL DEFAULT 0,
+    backup_daily INTEGER NOT NULL DEFAULT 0,
+    last_backup INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ignored (
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    chat_name TEXT,
+    PRIMARY KEY (user_id, chat_id)
+);
 """
+
+SETTING_FIELDS = ("notify_deleted", "notify_edited", "notify_own", "backup_daily")
 
 
 class DB:
@@ -104,7 +120,7 @@ class DB:
         async with self.conn.execute(
             "SELECT m.chat_id, m.chat_name, COUNT(*) n, SUM(m.deleted) d FROM messages m "
             "JOIN connections c ON c.id=m.connection_id WHERE c.user_id=? "
-            "GROUP BY m.chat_id ORDER BY MAX(m.date) DESC LIMIT 30",
+            "GROUP BY m.chat_id ORDER BY MAX(m.date) DESC LIMIT 200",
             (user_id,),
         ) as c:
             return await c.fetchall()
@@ -124,3 +140,69 @@ class DB:
         async with self.conn.execute(q, args) as c:
             rows = await c.fetchall()
         return list(reversed(rows))
+
+    # ---- settings / ignore / backup ----
+
+    async def get_settings(self, user_id) -> dict:
+        await self.conn.execute("INSERT OR IGNORE INTO settings (user_id) VALUES (?)", (user_id,))
+        await self.conn.commit()
+        async with self.conn.execute("SELECT * FROM settings WHERE user_id=?", (user_id,)) as c:
+            return dict(await c.fetchone())
+
+    async def toggle_setting(self, user_id, field):
+        if field not in SETTING_FIELDS:
+            raise ValueError(field)
+        await self.get_settings(user_id)
+        await self.conn.execute(f"UPDATE settings SET {field} = 1 - {field} WHERE user_id=?", (user_id,))
+        await self.conn.commit()
+
+    async def set_last_backup(self, user_id, ts):
+        await self.conn.execute("UPDATE settings SET last_backup=? WHERE user_id=?", (ts, user_id))
+        await self.conn.commit()
+
+    async def due_backups(self, now, every=86400):
+        async with self.conn.execute(
+            "SELECT user_id FROM settings WHERE backup_daily=1 AND last_backup <= ?", (now - every,)
+        ) as c:
+            return [r["user_id"] for r in await c.fetchall()]
+
+    async def is_ignored(self, user_id, chat_id) -> bool:
+        async with self.conn.execute(
+            "SELECT 1 FROM ignored WHERE user_id=? AND chat_id=?", (user_id, chat_id)
+        ) as c:
+            return await c.fetchone() is not None
+
+    async def set_ignored(self, user_id, chat_id, name, flag: bool):
+        if flag:
+            await self.conn.execute(
+                "INSERT OR REPLACE INTO ignored VALUES (?,?,?)", (user_id, chat_id, name)
+            )
+        else:
+            await self.conn.execute(
+                "DELETE FROM ignored WHERE user_id=? AND chat_id=?", (user_id, chat_id)
+            )
+        await self.conn.commit()
+
+    async def ignored_list(self, user_id):
+        async with self.conn.execute(
+            "SELECT chat_id, chat_name FROM ignored WHERE user_id=? ORDER BY chat_name", (user_id,)
+        ) as c:
+            return await c.fetchall()
+
+    async def chat_name(self, user_id, chat_id) -> str:
+        async with self.conn.execute(
+            "SELECT m.chat_name FROM messages m JOIN connections c ON c.id=m.connection_id "
+            "WHERE c.user_id=? AND m.chat_id=? LIMIT 1",
+            (user_id, chat_id),
+        ) as c:
+            r = await c.fetchone()
+        return (r["chat_name"] if r else None) or str(chat_id)
+
+    async def chat_stats(self, user_id, chat_id):
+        async with self.conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(m.deleted),0) d, COALESCE(SUM(m.edited),0) e "
+            "FROM messages m JOIN connections c ON c.id=m.connection_id "
+            "WHERE c.user_id=? AND m.chat_id=?",
+            (user_id, chat_id),
+        ) as c:
+            return await c.fetchone()
