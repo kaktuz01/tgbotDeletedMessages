@@ -46,6 +46,24 @@ CREATE TABLE IF NOT EXISTS ignored (
 );
 """
 
+SCHEMA += """
+CREATE TABLE IF NOT EXISTS access (
+    user_id INTEGER PRIMARY KEY,
+    trial_until INTEGER NOT NULL DEFAULT 0,
+    paid_until INTEGER NOT NULL DEFAULT 0,
+    last_nudge INTEGER NOT NULL DEFAULT 0,
+    free INTEGER NOT NULL DEFAULT 0,
+    name TEXT,
+    req_ts INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS payments (
+    charge_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    stars INTEGER NOT NULL,
+    ts INTEGER NOT NULL
+);
+"""
+
 SETTING_FIELDS = ("notify_deleted", "notify_edited", "notify_own", "backup_daily")
 
 
@@ -206,3 +224,76 @@ class DB:
             (user_id, chat_id),
         ) as c:
             return await c.fetchone()
+
+    # ---- access / payments ----
+
+    async def get_access(self, user_id):
+        async with self.conn.execute("SELECT * FROM access WHERE user_id=?", (user_id,)) as c:
+            r = await c.fetchone()
+        return dict(r) if r else None
+
+    async def start_trial(self, user_id, days, now):
+        await self.conn.execute("INSERT OR IGNORE INTO access (user_id) VALUES (?)", (user_id,))
+        await self.conn.execute(
+            "UPDATE access SET trial_until=? WHERE user_id=? AND trial_until=0 AND paid_until=0",
+            (now + days * 86400, user_id),
+        )
+        await self.conn.commit()
+
+    async def add_paid(self, user_id, days, charge_id, stars, now) -> int | None:
+        """Extend the subscription. Returns new paid_until, or None for a duplicate charge."""
+        cur = await self.conn.execute(
+            "INSERT OR IGNORE INTO payments VALUES (?,?,?,?)", (charge_id, user_id, stars, now)
+        )
+        if cur.rowcount == 0:
+            await self.conn.commit()
+            return None
+        await self.conn.execute("INSERT OR IGNORE INTO access (user_id) VALUES (?)", (user_id,))
+        await self.conn.execute(
+            "UPDATE access SET paid_until = MAX(?, paid_until) + ? WHERE user_id=?",
+            (now, days * 86400, user_id),
+        )
+        await self.conn.commit()
+        return (await self.get_access(user_id))["paid_until"]
+
+    async def touch_nudge(self, user_id, ts):
+        await self.conn.execute("UPDATE access SET last_nudge=? WHERE user_id=?", (ts, user_id))
+        await self.conn.commit()
+
+    async def set_free(self, user_id, flag: bool, name=None):
+        await self.conn.execute("INSERT OR IGNORE INTO access (user_id) VALUES (?)", (user_id,))
+        await self.conn.execute(
+            "UPDATE access SET free=?, name=COALESCE(?, name) WHERE user_id=?", (int(flag), name, user_id)
+        )
+        await self.conn.commit()
+
+    async def free_list(self):
+        async with self.conn.execute(
+            "SELECT user_id, name FROM access WHERE free=1 ORDER BY name"
+        ) as c:
+            return await c.fetchall()
+
+    async def set_request(self, user_id, name, now, cooldown=3600) -> bool:
+        """Record a free-access request. False if one was sent recently."""
+        await self.conn.execute("INSERT OR IGNORE INTO access (user_id) VALUES (?)", (user_id,))
+        cur = await self.conn.execute(
+            "UPDATE access SET name=?, req_ts=? WHERE user_id=? AND req_ts <= ?",
+            (name, now, user_id, now - cooldown),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def stats(self, now):
+        async with self.conn.execute(
+            "SELECT COUNT(*) users, COALESCE(SUM(free=1),0) friends, "
+            "COALESCE(SUM(paid_until>?),0) paid, "
+            "COALESCE(SUM(trial_until>? AND paid_until<=? AND free=0),0) trial FROM access",
+            (now, now, now),
+        ) as c:
+            r = dict(await c.fetchone())
+        async with self.conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(stars),0) stars FROM payments"
+        ) as c:
+            p = await c.fetchone()
+        r["payments"], r["stars"] = p["n"], p["stars"]
+        return r

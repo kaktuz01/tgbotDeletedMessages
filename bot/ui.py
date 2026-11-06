@@ -1,17 +1,20 @@
 import logging
 
 from aiogram import Bot, F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton as Btn,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .backup import send_backup
+from .billing import ADMINS, PLAN_DAYS, PRICE_STARS, TRIAL_DAYS, describe, status
 from .db import DB
 from .safe import safe
 from .util import esc, fmt_ts
@@ -33,6 +36,8 @@ START_TEXT = (
     "📚 история чатов файлом\n"
     "📦 резервные копии\n"
     f"{LINE}\n"
+    "{status}\n"
+    f"{LINE}\n"
     "Выберите действие 👇"
 )
 HELP_TEXT = (
@@ -48,6 +53,9 @@ HELP_TEXT = (
     "• работает в личных чатах (группы и секретные чаты недоступны)\n"
     "• файлы больше 20 МБ и таймерные медиа сохранить нельзя\n"
     "• 🔕 игнорируемый чат не сохраняется и без уведомлений\n\n"
+    f"<b>Оплата</b>\nПервые {TRIAL_DAYS} дня бесплатно, дальше подписка в ⭐ Telegram Stars. "
+    "После окончания срока бот продолжает сохранять переписку, но уведомления и выгрузка "
+    "закрыты до оплаты. Проблемы с оплатой — /paysupport\n\n"
     "Вопросы и предложения — пишите автору 👇"
 )
 SETTING_LABELS = {
@@ -58,13 +66,18 @@ SETTING_LABELS = {
 }
 
 
-def main_kb() -> InlineKeyboardMarkup:
+def main_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="💬 Чаты", callback_data="c:0")
     kb.button(text="⚙️ Настройки", callback_data="s")
     kb.button(text="📦 Бэкап", callback_data="bk")
     kb.button(text="🆘 Помощь", callback_data="h")
-    kb.adjust(2, 2)
+    kb.button(text="💎 Подписка", callback_data="sub")
+    layout = [2, 2, 1]
+    if user_id in ADMINS:
+        kb.button(text="👑 Админ", callback_data="adm")
+        layout.append(1)
+    kb.adjust(*layout)
     return kb.as_markup()
 
 
@@ -89,10 +102,15 @@ async def show(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup, alert: st
     await safe(cb.answer, alert)
 
 
+async def start_text(db: DB, user_id: int) -> str:
+    _, kind, until = await status(db, user_id)
+    return START_TEXT.replace("{status}", describe(kind, until))
+
+
 @router.message(CommandStart())
 @router.message(F.text)
-async def start(msg: Message):
-    await safe(msg.answer, START_TEXT, reply_markup=main_kb())
+async def start(msg: Message, db: DB):
+    await safe(msg.answer, await start_text(db, msg.from_user.id), reply_markup=main_kb(msg.from_user.id))
 
 
 @router.callback_query(F.data == "noop")
@@ -101,8 +119,8 @@ async def noop(cb: CallbackQuery):
 
 
 @router.callback_query(F.data == "m")
-async def menu(cb: CallbackQuery):
-    await show(cb, START_TEXT, main_kb())
+async def menu(cb: CallbackQuery, db: DB):
+    await show(cb, await start_text(db, cb.from_user.id), main_kb(cb.from_user.id))
 
 
 @router.callback_query(F.data == "h")
@@ -190,6 +208,9 @@ async def quick_ignore(cb: CallbackQuery, db: DB):
 
 @router.callback_query(F.data.startswith("x:"))
 async def export(cb: CallbackQuery, db: DB):
+    if not (await status(db, cb.from_user.id))[0]:
+        await render_sub(cb, db, "🔒 Выгрузка доступна по подписке")
+        return
     _, cid, mode = cb.data.split(":")
     chat_id = int(cid)
     rows = await db.history(
@@ -277,7 +298,185 @@ async def unignore(cb: CallbackQuery, db: DB):
 
 @router.callback_query(F.data == "bk")
 async def backup_now(cb: CallbackQuery, bot: Bot, db: DB):
+    if not (await status(db, cb.from_user.id))[0]:
+        await render_sub(cb, db, "🔒 Бэкап доступен по подписке")
+        return
     await safe(cb.answer, "Готовлю бэкап…")
     ok = await send_backup(bot, db, cb.from_user.id)
     if not ok and isinstance(cb.message, Message):
         await safe(cb.message.answer, "⚠️ Не удалось создать бэкап. Подробности в логах бота.")
+
+
+# ---------- subscription (Telegram Stars) ----------
+
+def sub_kb(kind: str = "none") -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if kind not in ("admin", "free"):
+        kb.button(
+            text=f"⭐ {'Продлить' if kind == 'paid' else 'Оплатить'} на {PLAN_DAYS} дн. · {PRICE_STARS} ⭐",
+            callback_data="pay",
+        )
+    if kind in ("none", "trial", "expired"):
+        if ADMINS:
+            kb.button(text="🙋 Я друг автора: доступ бесплатно", callback_data="fr")
+        else:
+            kb.button(text="🙋 Я друг автора", url=CONTACT_URL)
+    kb.button(text="🏠 Меню", callback_data="m")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def render_sub(cb: CallbackQuery, db: DB, alert: str | None = None):
+    active, kind, until = await status(db, cb.from_user.id)
+    text = (
+        f"💎 <b>Подписка</b>\n{LINE}\n{describe(kind, until)}\n\n"
+        f"Доступ на {PLAN_DAYS} дн.: <b>{PRICE_STARS} ⭐</b>\n"
+        "Оплата прямо в Telegram, дни добавляются к текущему сроку.\n\n"
+        "Без подписки бот продолжает сохранять переписку, но уведомления "
+        "и выгрузка закрыты до оплаты.\n\n"
+        f"🆔 Ваш ID: <code>{cb.from_user.id}</code>"
+    )
+    await show(cb, text, sub_kb(kind), alert)
+
+
+@router.callback_query(F.data == "sub")
+async def sub_view(cb: CallbackQuery, db: DB):
+    await render_sub(cb, db)
+
+
+@router.callback_query(F.data == "pay")
+async def pay(cb: CallbackQuery, bot: Bot):
+    await safe(
+        bot.send_invoice,
+        cb.from_user.id,
+        title=f"Доступ на {PLAN_DAYS} дн.",
+        description="Уведомления об удалённых и изменённых сообщениях, история и бэкапы.",
+        payload=f"sub:{PLAN_DAYS}",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{PLAN_DAYS} дн.", amount=PRICE_STARS)],
+    )
+    await safe(cb.answer)
+
+
+@router.pre_checkout_query()
+async def pre_checkout(q: PreCheckoutQuery):
+    ok = q.invoice_payload.startswith("sub:") and q.currency == "XTR"
+    await safe(q.answer, ok=ok, error_message=None if ok else "Неизвестный товар")
+
+
+@router.message(F.successful_payment)
+async def paid(msg: Message, db: DB):
+    import time
+
+    sp = msg.successful_payment
+    until = await db.add_paid(
+        msg.from_user.id, PLAN_DAYS, sp.telegram_payment_charge_id, sp.total_amount, int(time.time())
+    )
+    if until is None:  # duplicate delivery of the same payment
+        return
+    await safe(
+        msg.answer,
+        f"✅ <b>Оплата получена, спасибо!</b>\n{describe('paid', until)}",
+        reply_markup=main_kb(msg.from_user.id),
+    )
+
+
+@router.message(Command("paysupport"))
+async def paysupport(msg: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✉️ Написать автору", url=CONTACT_URL)
+    await safe(
+        msg.answer,
+        "💬 <b>Поддержка по оплате</b>\nЕсли списали звёзды, а доступ не появился, "
+        "или нужен возврат — напишите автору, укажите свой ID и время платежа.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+# ---------- free access for friends + admin panel ----------
+
+@router.callback_query(F.data == "fr")
+async def friend_request(cb: CallbackQuery, bot: Bot, db: DB):
+    import time
+
+    u = cb.from_user
+    name = u.full_name + (f" (@{u.username})" if u.username else "")
+    if not await db.set_request(u.id, name, int(time.time())):
+        await safe(cb.answer, "Запрос уже отправлен, дождитесь ответа автора", show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Одобрить", callback_data=f"fa:{u.id}:1")
+    kb.button(text="❌ Отказать", callback_data=f"fa:{u.id}:0")
+    kb.adjust(2)
+    for admin in ADMINS:
+        await safe(
+            bot.send_message,
+            admin,
+            f"🙋 <b>Запрос бесплатного доступа</b>\n👤 {esc(name)}\n🆔 <code>{u.id}</code>",
+            reply_markup=kb.as_markup(),
+        )
+    await safe(cb.answer, "Запрос отправлен автору. Я напишу, когда он ответит 🙌", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("fa:"))
+async def friend_answer(cb: CallbackQuery, bot: Bot, db: DB):
+    if cb.from_user.id not in ADMINS:
+        await safe(cb.answer, "Недостаточно прав", show_alert=True)
+        return
+    _, uid, flag = cb.data.split(":")
+    ok = flag == "1"
+    if ok:
+        await db.set_free(int(uid), True)
+    if isinstance(cb.message, Message):
+        await safe(
+            cb.message.edit_text,
+            f"{cb.message.html_text}\n\n{'✅ Одобрено' if ok else '❌ Отклонено'}",
+        )
+    await safe(
+        bot.send_message,
+        int(uid),
+        "🤝 <b>Автор выдал вам бесплатный доступ!</b> Спасибо, что вы с нами."
+        if ok
+        else "К сожалению, автор не одобрил бесплатный доступ. Можно оформить подписку в меню 💎",
+        reply_markup=main_kb(int(uid)) if ok else None,
+    )
+    await safe(cb.answer)
+
+
+async def render_admin(cb: CallbackQuery, db: DB):
+    import time
+
+    st = await db.stats(int(time.time()))
+    friends = await db.free_list()
+    kb = InlineKeyboardBuilder()
+    for f in friends:
+        kb.button(text=f"❌ {(f['name'] or str(f['user_id']))[:30]}", callback_data=f"fd:{f['user_id']}")
+    kb.button(text="🏠 Меню", callback_data="m")
+    kb.adjust(1)
+    text = (
+        f"👑 <b>Админ</b>\n{LINE}\n"
+        f"👥 Пользователей: <b>{st['users']}</b>\n"
+        f"🎁 На пробном периоде: <b>{st['trial']}</b>\n"
+        f"💎 С активной подпиской: <b>{st['paid']}</b>\n"
+        f"🤝 Друзей (бесплатно): <b>{st['friends']}</b>\n"
+        f"⭐ Получено звёзд: <b>{st['stars']}</b> ({st['payments']} платежей)\n"
+        + ("\nНажмите на друга, чтобы снять бесплатный доступ:" if friends else "")
+    )
+    await show(cb, text, kb.as_markup())
+
+
+@router.callback_query(F.data == "adm")
+async def admin_view(cb: CallbackQuery, db: DB):
+    if cb.from_user.id not in ADMINS:
+        await safe(cb.answer, "Недостаточно прав", show_alert=True)
+        return
+    await render_admin(cb, db)
+
+
+@router.callback_query(F.data.startswith("fd:"))
+async def friend_delete(cb: CallbackQuery, db: DB):
+    if cb.from_user.id not in ADMINS:
+        await safe(cb.answer, "Недостаточно прав", show_alert=True)
+        return
+    await db.set_free(int(cb.data[3:]), False)
+    await render_admin(cb, db)

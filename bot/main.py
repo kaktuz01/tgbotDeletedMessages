@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, Router
@@ -17,9 +18,10 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from .backup import backup_loop
+from .billing import TRIAL_DAYS, describe, status
 from .db import DB
 from .safe import safe
-from .ui import quick_ignore_kb
+from .ui import quick_ignore_kb, sub_kb
 from .ui import router as ui_router
 from .util import esc, fmt_ts, full_name, quote
 
@@ -97,14 +99,35 @@ async def get_conn(bot: Bot, db: DB, cid: str):
 @router.business_connection()
 async def on_connection(conn: BusinessConnection, bot: Bot, db: DB):
     await db.upsert_connection(conn.id, conn.user.id, conn.user_chat_id, conn.is_enabled)
-    text = (
-        "✅ <b>Бот подключён!</b>\n"
-        "Теперь я сохраняю переписку и пришлю всё, что удалят или изменят.\n\n"
-        "Меню, история и настройки — /start"
-        if conn.is_enabled
-        else "⛔ Бот отключён от вашего аккаунта."
-    )
+    if conn.is_enabled:
+        await db.start_trial(conn.user.id, TRIAL_DAYS, int(time.time()))
+        _, kind, until = await status(db, conn.user.id)
+        text = (
+            "✅ <b>Бот подключён!</b>\n"
+            "Теперь я сохраняю переписку и пришлю всё, что удалят или изменят.\n\n"
+            f"{describe(kind, until)}\n"
+            "Меню, история и настройки — /start"
+        )
+    else:
+        text = "⛔ Бот отключён от вашего аккаунта."
     await safe(bot.send_message, conn.user_chat_id, text)
+
+
+async def nudge(bot: Bot, db: DB, conn, hidden: int):
+    """Tell an expired user (at most once a day) that something was deleted but is locked."""
+    uid, now = conn["user_id"], int(time.time())
+    a = await db.get_access(uid)
+    if a is not None and now - a["last_nudge"] < 86400:
+        return
+    await db.touch_nudge(uid, now)
+    await safe(
+        bot.send_message,
+        conn["user_chat_id"],
+        f"🔒 <b>Удалено сообщений: {hidden}</b>\n"
+        "Доступ закончился, поэтому показать их я не могу, но всё сохранено. "
+        "Оформите подписку, и уведомления вернутся.",
+        reply_markup=sub_kb("expired"),
+    )
 
 
 @router.business_message()
@@ -128,15 +151,18 @@ async def on_edited(msg: Message, bot: Bot, db: DB):
         s = await db.get_settings(conn["user_id"])
         own = old["from_id"] == conn["user_id"]
         if s["notify_edited"] and (not own or s["notify_own"]):
-            await safe(
-                bot.send_message,
-                conn["user_chat_id"],
-                f"✏️ <b>Сообщение изменено</b>\n"
-                f"👤 {esc(old['from_name'])}\n🕒 {fmt_ts(old['date'])}\n\n"
-                f"<b>Было:</b>\n{quote(old['text'], 1500)}\n"
-                f"<b>Стало:</b>\n{quote(new_text, 1500)}",
-                reply_markup=quick_ignore_kb(msg.chat.id, False),
-            )
+            if not (await status(db, conn["user_id"]))[0]:
+                await nudge(bot, db, conn, 1)
+            else:
+                await safe(
+                    bot.send_message,
+                    conn["user_chat_id"],
+                    f"✏️ <b>Сообщение изменено</b>\n"
+                    f"👤 {esc(old['from_name'])}\n🕒 {fmt_ts(old['date'])}\n\n"
+                    f"<b>Было:</b>\n{quote(old['text'], 1500)}\n"
+                    f"<b>Стало:</b>\n{quote(new_text, 1500)}",
+                    reply_markup=quick_ignore_kb(msg.chat.id, False),
+                )
     await store(bot, db, msg)
 
 
@@ -171,17 +197,23 @@ async def on_deleted(event: BusinessMessagesDeleted, bot: Bot, db: DB):
     s = await db.get_settings(conn["user_id"])
     if not s["notify_deleted"]:
         return
-    missing = 0
+    active = (await status(db, conn["user_id"]))[0]
+    missing = hidden = 0
     for mid in event.message_ids:
         try:
             row = await db.get_message(cid, event.chat.id, mid)
             if row is None:
                 missing += 1
             elif row["from_id"] != conn["user_id"] or s["notify_own"]:
-                await notify_deleted(bot, conn["user_chat_id"], row)
+                if active:
+                    await notify_deleted(bot, conn["user_chat_id"], row)
+                else:
+                    hidden += 1
         except Exception:
             log.exception("failed to notify about deleted message %s", mid)
-    if missing:
+    if hidden:
+        await nudge(bot, db, conn, hidden)
+    if missing and active:
         await safe(
             bot.send_message,
             conn["user_chat_id"],
@@ -212,7 +244,13 @@ async def main():
     dp.include_router(router)
     dp.include_router(ui_router)
     dp.errors.register(on_error)
-    await safe(bot.set_my_commands, [BotCommand(command="start", description="Меню")])
+    await safe(
+        bot.set_my_commands,
+        [
+            BotCommand(command="start", description="Меню"),
+            BotCommand(command="paysupport", description="Поддержка по оплате"),
+        ],
+    )
     task = asyncio.create_task(backup_loop(bot, db))
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

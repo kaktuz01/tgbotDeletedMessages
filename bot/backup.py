@@ -11,6 +11,7 @@ from pathlib import Path
 from aiogram import Bot
 from aiogram.types import FSInputFile
 
+from .billing import status
 from .db import DB
 from .safe import safe
 
@@ -74,7 +75,8 @@ async def backup_loop(bot: Bot, db: DB):
     while True:
         try:
             for uid in await db.due_backups(int(time.time())):
-                await send_backup(bot, db, uid)
+                if (await status(db, uid))[0]:
+                    await send_backup(bot, db, uid)
         except Exception:
             log.exception("backup loop error")
         await asyncio.sleep(3600)
