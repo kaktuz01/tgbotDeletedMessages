@@ -21,7 +21,7 @@ from .db import DB
 from .safe import safe
 from .ui import quick_ignore_kb
 from .ui import router as ui_router
-from .util import esc, fmt_ts, full_name
+from .util import esc, fmt_ts, full_name, quote
 
 load_dotenv()
 log = logging.getLogger("bot")
@@ -98,8 +98,9 @@ async def get_conn(bot: Bot, db: DB, cid: str):
 async def on_connection(conn: BusinessConnection, bot: Bot, db: DB):
     await db.upsert_connection(conn.id, conn.user.id, conn.user_chat_id, conn.is_enabled)
     text = (
-        "✅ Бот подключён. Начинаю сохранять переписку и удалённые сообщения.\n"
-        "Настройки и история — /start"
+        "✅ <b>Бот подключён!</b>\n"
+        "Теперь я сохраняю переписку и пришлю всё, что удалят или изменят.\n\n"
+        "Меню, история и настройки — /start"
         if conn.is_enabled
         else "⛔ Бот отключён от вашего аккаунта."
     )
@@ -130,9 +131,10 @@ async def on_edited(msg: Message, bot: Bot, db: DB):
             await safe(
                 bot.send_message,
                 conn["user_chat_id"],
-                f"✏️ <b>{esc(old['chat_name'])}</b> — {esc(old['from_name'])} изменил(а) сообщение\n\n"
-                f"<b>Было:</b>\n{esc((old['text'] or '')[:1500])}\n\n"
-                f"<b>Стало:</b>\n{esc((new_text or '')[:1500])}",
+                f"✏️ <b>Сообщение изменено</b>\n"
+                f"👤 {esc(old['from_name'])}\n🕒 {fmt_ts(old['date'])}\n\n"
+                f"<b>Было:</b>\n{quote(old['text'], 1500)}\n"
+                f"<b>Стало:</b>\n{quote(new_text, 1500)}",
                 reply_markup=quick_ignore_kb(msg.chat.id, False),
             )
     await store(bot, db, msg)
@@ -140,8 +142,8 @@ async def on_edited(msg: Message, bot: Bot, db: DB):
 
 async def notify_deleted(bot: Bot, owner: int, row):
     header = (
-        f"🗑 <b>{esc(row['chat_name'])}</b> — {esc(row['from_name'])} удалил(а) сообщение "
-        f"от {fmt_ts(row['date'])}"
+        f"🗑 <b>Сообщение удалено</b>\n"
+        f"👤 {esc(row['from_name'])}\n🕒 {fmt_ts(row['date'])}"
     )
     markup = quick_ignore_kb(row["chat_id"], False)
     kind, path = row["media_kind"], row["media_path"]
@@ -152,10 +154,10 @@ async def notify_deleted(bot: Bot, owner: int, row):
             if await safe(getattr(bot, sender), owner, FSInputFile(path)) is None:
                 await safe(bot.send_message, owner, "⚠️ Не удалось отправить файл.")
             return
-        caption = header + (f"\n\n{esc(row['text'])}" if row["text"] else "")
-        if await safe(getattr(bot, sender), owner, FSInputFile(path), caption=caption[:1024], reply_markup=markup):
+        caption = header + (f"\n\n{quote(row['text'], 700)}" if row["text"] else "")
+        if await safe(getattr(bot, sender), owner, FSInputFile(path), caption=caption, reply_markup=markup):
             return
-    body = f"\n\n{esc((row['text'] or '')[:3500])}" if row["text"] else f"\n\n[{kind or 'нет текста'}]"
+    body = f"\n\n{quote(row['text'], 3000)}" if row["text"] else f"\n\n<i>[{esc(kind or 'нет текста')}]</i>"
     await safe(bot.send_message, owner, header + body, reply_markup=markup)
 
 
@@ -183,8 +185,9 @@ async def on_deleted(event: BusinessMessagesDeleted, bot: Bot, db: DB):
         await safe(
             bot.send_message,
             conn["user_chat_id"],
-            f"🗑 В чате <b>{esc(event.chat.full_name)}</b> удалено сообщений: {missing}, "
-            "но бот не успел их сохранить.",
+            f"🗑 <b>Удалено сообщений: {missing}</b>\n"
+            f"👤 {esc(event.chat.full_name)}\n"
+            "<i>Бот не успел их сохранить: они пришли до подключения.</i>",
             reply_markup=quick_ignore_kb(event.chat.id, False),
         )
 

@@ -20,11 +20,35 @@ log = logging.getLogger("bot.ui")
 router = Router()
 PAGE = 8
 
+CONTACT_URL = "https://t.me/kaktuz_01"
+LINE = "━━━━━━━━━━━━━━━━"
+
 START_TEXT = (
-    "👋 Я сохраняю удалённые и изменённые сообщения из ваших личных чатов.\n\n"
-    "<b>Подключение:</b> Настройки Telegram → Telegram для бизнеса → Чат-боты → "
-    "выберите этого бота и включите право читать сообщения (нужен Premium).\n\n"
-    "Управление — кнопками ниже 👇"
+    "🕵️ <b>Ничего не пропадёт</b>\n"
+    f"{LINE}\n"
+    "Я сохраняю переписку из ваших личных чатов и присылаю то, что собеседник "
+    "удалил или изменил.\n\n"
+    "🗑 удалённые сообщения и медиа\n"
+    "✏️ правки: было → стало\n"
+    "📚 история чатов файлом\n"
+    "📦 резервные копии\n"
+    f"{LINE}\n"
+    "Выберите действие 👇"
+)
+HELP_TEXT = (
+    "🆘 <b>Помощь</b>\n"
+    f"{LINE}\n"
+    "<b>Как подключить</b>\n"
+    "1️⃣ Настройки Telegram → <i>Telegram для бизнеса</i> → <i>Чат-боты</i>\n"
+    "2️⃣ Выберите этого бота\n"
+    "3️⃣ Включите право <i>читать сообщения</i>\n"
+    "После этого бот напишет «Бот подключён». Нужен Telegram Premium.\n\n"
+    "<b>Что важно знать</b>\n"
+    "• бот видит только то, что пришло после подключения\n"
+    "• работает в личных чатах (группы и секретные чаты недоступны)\n"
+    "• файлы больше 20 МБ и таймерные медиа сохранить нельзя\n"
+    "• 🔕 игнорируемый чат не сохраняется и без уведомлений\n\n"
+    "Вопросы и предложения — пишите автору 👇"
 )
 SETTING_LABELS = {
     "notify_deleted": "Уведомлять об удалённых",
@@ -38,7 +62,16 @@ def main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="💬 Чаты", callback_data="c:0")
     kb.button(text="⚙️ Настройки", callback_data="s")
-    kb.button(text="📦 Бэкап сейчас", callback_data="bk")
+    kb.button(text="📦 Бэкап", callback_data="bk")
+    kb.button(text="🆘 Помощь", callback_data="h")
+    kb.adjust(2, 2)
+    return kb.as_markup()
+
+
+def help_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✉️ Написать автору", url=CONTACT_URL)
+    kb.button(text="🏠 Меню", callback_data="m")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -72,6 +105,11 @@ async def menu(cb: CallbackQuery):
     await show(cb, START_TEXT, main_kb())
 
 
+@router.callback_query(F.data == "h")
+async def help_view(cb: CallbackQuery):
+    await show(cb, HELP_TEXT, help_kb())
+
+
 # ---------- chats ----------
 
 @router.callback_query(F.data.startswith("c:"))
@@ -97,7 +135,7 @@ async def chats(cb: CallbackQuery, db: DB):
         nav.append(Btn(text="▶", callback_data=f"c:{page + 1}"))
     kb.row(*nav)
     kb.row(Btn(text="🏠 Меню", callback_data="m"))
-    await show(cb, "<b>Сохранённые чаты</b>\nВыберите чат:", kb.as_markup())
+    await show(cb, f"💬 <b>Сохранённые чаты</b>\n{LINE}\nВыберите чат 👇", kb.as_markup())
 
 
 async def render_chat(cb: CallbackQuery, db: DB, chat_id: int, alert: str | None = None):
@@ -116,8 +154,9 @@ async def render_chat(cb: CallbackQuery, db: DB, chat_id: int, alert: str | None
     kb.button(text="◀ К чатам", callback_data="c:0")
     kb.adjust(1)
     text = (
-        f"<b>{esc(name)}</b>\nСообщений: {st['n']} · удалено: {st['d']} · изменено: {st['e']}"
-        + ("\n🔕 <i>Чат игнорируется: не сохраняется и без уведомлений</i>" if ignored else "")
+        f"👤 <b>{esc(name)}</b>\n{LINE}\n"
+        f"💬 Сообщений: <b>{st['n']}</b>\n🗑 Удалено: <b>{st['d']}</b>\n✏️ Изменено: <b>{st['e']}</b>"
+        + ("\n\n🔕 <i>Чат игнорируется: не сохраняется и без уведомлений</i>" if ignored else "")
     )
     await show(cb, text, kb.as_markup(), alert)
 
@@ -188,8 +227,8 @@ async def render_settings(cb: CallbackQuery, db: DB, alert: str | None = None):
     kb.adjust(1)
     await show(
         cb,
-        "<b>Настройки</b>\nНажмите на пункт, чтобы включить или выключить.\n"
-        "Бэкап приходит файлом раз в сутки и содержит только ваши данные.",
+        f"⚙️ <b>Настройки</b>\n{LINE}\nНажмите на пункт, чтобы включить или выключить.\n"
+        "📦 Бэкап приходит файлом раз в сутки и содержит только ваши данные.",
         kb.as_markup(),
         alert,
     )
@@ -218,7 +257,7 @@ async def render_ignored(cb: CallbackQuery, db: DB):
     kb.button(text="◀ Настройки", callback_data="s")
     kb.adjust(1)
     text = (
-        "<b>Игнорируемые чаты</b>\nНажмите на чат, чтобы снова следить за ним:"
+        f"🚫 <b>Игнорируемые чаты</b>\n{LINE}\nНажмите на чат, чтобы снова следить за ним:"
         if rows
         else "Игнорируемых чатов нет."
     )
