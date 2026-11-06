@@ -9,6 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeChat,
     BusinessConnection,
     BusinessMessagesDeleted,
     ErrorEvent,
@@ -18,10 +19,11 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from .backup import backup_loop
-from .billing import TRIAL_DAYS, describe, status
+from .billing import ADMINS, TRIAL_DAYS, describe, status
 from .db import DB
 from .safe import safe
 from .ui import quick_ignore_kb, sub_kb
+from .ui import register_middlewares
 from .ui import router as ui_router
 from .util import esc, fmt_ts, full_name, quote
 
@@ -244,6 +246,7 @@ async def main():
     dp.include_router(router)
     dp.include_router(ui_router)
     dp.errors.register(on_error)
+    register_middlewares(dp)
     await safe(
         bot.set_my_commands,
         [
@@ -251,6 +254,18 @@ async def main():
             BotCommand(command="paysupport", description="Поддержка по оплате"),
         ],
     )
+    for admin in ADMINS:
+        await safe(
+            bot.set_my_commands,
+            [
+                BotCommand(command="start", description="Меню"),
+                BotCommand(command="addfriend", description="Добавить друга: /addfriend @ник"),
+                BotCommand(command="delfriend", description="Снять доступ: /delfriend @ник"),
+                BotCommand(command="friends", description="Список друзей"),
+                BotCommand(command="paysupport", description="Поддержка по оплате"),
+            ],
+            scope=BotCommandScopeChat(chat_id=admin),
+        )
     task = asyncio.create_task(backup_loop(bot, db))
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

@@ -53,8 +53,7 @@ CREATE TABLE IF NOT EXISTS access (
     paid_until INTEGER NOT NULL DEFAULT 0,
     last_nudge INTEGER NOT NULL DEFAULT 0,
     free INTEGER NOT NULL DEFAULT 0,
-    name TEXT,
-    req_ts INTEGER NOT NULL DEFAULT 0
+    name TEXT
 );
 CREATE TABLE IF NOT EXISTS payments (
     charge_id TEXT PRIMARY KEY,
@@ -62,6 +61,17 @@ CREATE TABLE IF NOT EXISTS payments (
     stars INTEGER NOT NULL,
     ts INTEGER NOT NULL
 );
+"""
+
+SCHEMA += """
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    name TEXT,
+    last_seen INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
+CREATE TABLE IF NOT EXISTS pending_free (username TEXT PRIMARY KEY);
 """
 
 SETTING_FIELDS = ("notify_deleted", "notify_edited", "notify_own", "backup_daily")
@@ -269,19 +279,10 @@ class DB:
 
     async def free_list(self):
         async with self.conn.execute(
-            "SELECT user_id, name FROM access WHERE free=1 ORDER BY name"
+            "SELECT a.user_id, COALESCE(u.username, '') username, COALESCE(a.name, u.name) name "
+            "FROM access a LEFT JOIN users u ON u.user_id = a.user_id WHERE a.free=1 ORDER BY name"
         ) as c:
             return await c.fetchall()
-
-    async def set_request(self, user_id, name, now, cooldown=3600) -> bool:
-        """Record a free-access request. False if one was sent recently."""
-        await self.conn.execute("INSERT OR IGNORE INTO access (user_id) VALUES (?)", (user_id,))
-        cur = await self.conn.execute(
-            "UPDATE access SET name=?, req_ts=? WHERE user_id=? AND req_ts <= ?",
-            (name, now, user_id, now - cooldown),
-        )
-        await self.conn.commit()
-        return cur.rowcount > 0
 
     async def stats(self, now):
         async with self.conn.execute(
@@ -297,3 +298,47 @@ class DB:
             p = await c.fetchone()
         r["payments"], r["stars"] = p["n"], p["stars"]
         return r
+
+    # ---- users directory (for granting access by @username) ----
+
+    async def touch_user(self, user_id, username, name, now) -> bool:
+        """Remember a user who talks to the bot. True if a pending free grant was just applied."""
+        uname = username.lower() if username else None
+        await self.conn.execute(
+            "INSERT INTO users (user_id, username, name, last_seen) VALUES (?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, name=excluded.name, "
+            "last_seen=excluded.last_seen",
+            (user_id, uname, name, now),
+        )
+        granted = False
+        if uname:
+            cur = await self.conn.execute("DELETE FROM pending_free WHERE username=?", (uname,))
+            if cur.rowcount:
+                await self.conn.execute("INSERT OR IGNORE INTO access (user_id) VALUES (?)", (user_id,))
+                await self.conn.execute(
+                    "UPDATE access SET free=1, name=? WHERE user_id=?", (name, user_id)
+                )
+                granted = True
+        await self.conn.commit()
+        return granted
+
+    async def user_id_by_username(self, username):
+        async with self.conn.execute(
+            "SELECT user_id FROM users WHERE username=? ORDER BY last_seen DESC LIMIT 1",
+            (username.lower(),),
+        ) as c:
+            r = await c.fetchone()
+        return r["user_id"] if r else None
+
+    async def add_pending(self, username):
+        await self.conn.execute("INSERT OR IGNORE INTO pending_free VALUES (?)", (username.lower(),))
+        await self.conn.commit()
+
+    async def del_pending(self, username) -> bool:
+        cur = await self.conn.execute("DELETE FROM pending_free WHERE username=?", (username.lower(),))
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def pending_list(self):
+        async with self.conn.execute("SELECT username FROM pending_free ORDER BY username") as c:
+            return [r["username"] for r in await c.fetchall()]

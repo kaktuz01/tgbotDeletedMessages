@@ -1,7 +1,9 @@
 import logging
+import re
+import time
 
-from aiogram import Bot, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram import BaseMiddleware, Bot, F, Router
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -108,7 +110,6 @@ async def start_text(db: DB, user_id: int) -> str:
 
 
 @router.message(CommandStart())
-@router.message(F.text)
 async def start(msg: Message, db: DB):
     await safe(msg.answer, await start_text(db, msg.from_user.id), reply_markup=main_kb(msg.from_user.id))
 
@@ -316,11 +317,6 @@ def sub_kb(kind: str = "none") -> InlineKeyboardMarkup:
             text=f"⭐ {'Продлить' if kind == 'paid' else 'Оплатить'} на {PLAN_DAYS} дн. · {PRICE_STARS} ⭐",
             callback_data="pay",
         )
-    if kind in ("none", "trial", "expired"):
-        if ADMINS:
-            kb.button(text="🙋 Я друг автора: доступ бесплатно", callback_data="fr")
-        else:
-            kb.button(text="🙋 Я друг автора", url=CONTACT_URL)
     kb.button(text="🏠 Меню", callback_data="m")
     kb.adjust(1)
     return kb.as_markup()
@@ -393,55 +389,7 @@ async def paysupport(msg: Message):
     )
 
 
-# ---------- free access for friends + admin panel ----------
-
-@router.callback_query(F.data == "fr")
-async def friend_request(cb: CallbackQuery, bot: Bot, db: DB):
-    import time
-
-    u = cb.from_user
-    name = u.full_name + (f" (@{u.username})" if u.username else "")
-    if not await db.set_request(u.id, name, int(time.time())):
-        await safe(cb.answer, "Запрос уже отправлен, дождитесь ответа автора", show_alert=True)
-        return
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Одобрить", callback_data=f"fa:{u.id}:1")
-    kb.button(text="❌ Отказать", callback_data=f"fa:{u.id}:0")
-    kb.adjust(2)
-    for admin in ADMINS:
-        await safe(
-            bot.send_message,
-            admin,
-            f"🙋 <b>Запрос бесплатного доступа</b>\n👤 {esc(name)}\n🆔 <code>{u.id}</code>",
-            reply_markup=kb.as_markup(),
-        )
-    await safe(cb.answer, "Запрос отправлен автору. Я напишу, когда он ответит 🙌", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("fa:"))
-async def friend_answer(cb: CallbackQuery, bot: Bot, db: DB):
-    if cb.from_user.id not in ADMINS:
-        await safe(cb.answer, "Недостаточно прав", show_alert=True)
-        return
-    _, uid, flag = cb.data.split(":")
-    ok = flag == "1"
-    if ok:
-        await db.set_free(int(uid), True)
-    if isinstance(cb.message, Message):
-        await safe(
-            cb.message.edit_text,
-            f"{cb.message.html_text}\n\n{'✅ Одобрено' if ok else '❌ Отклонено'}",
-        )
-    await safe(
-        bot.send_message,
-        int(uid),
-        "🤝 <b>Автор выдал вам бесплатный доступ!</b> Спасибо, что вы с нами."
-        if ok
-        else "К сожалению, автор не одобрил бесплатный доступ. Можно оформить подписку в меню 💎",
-        reply_markup=main_kb(int(uid)) if ok else None,
-    )
-    await safe(cb.answer)
-
+# ---------- admin: friends with free access ----------
 
 async def render_admin(cb: CallbackQuery, db: DB):
     import time
@@ -460,7 +408,9 @@ async def render_admin(cb: CallbackQuery, db: DB):
         f"💎 С активной подпиской: <b>{st['paid']}</b>\n"
         f"🤝 Друзей (бесплатно): <b>{st['friends']}</b>\n"
         f"⭐ Получено звёзд: <b>{st['stars']}</b> ({st['payments']} платежей)\n"
-        + ("\nНажмите на друга, чтобы снять бесплатный доступ:" if friends else "")
+        + "\n<b>Друзья</b> (бесплатный доступ)"
+        + ("\nНажмите на друга, чтобы снять доступ:" if friends else "\nПока никого.")
+        + "\n\nКоманды: /addfriend @ник · /delfriend @ник · /friends"
     )
     await show(cb, text, kb.as_markup())
 
@@ -480,3 +430,92 @@ async def friend_delete(cb: CallbackQuery, db: DB):
         return
     await db.set_free(int(cb.data[3:]), False)
     await render_admin(cb, db)
+
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{4,32}$")
+
+
+def _usernames(command: CommandObject) -> list[str]:
+    return [t.lstrip("@") for t in (command.args or "").split() if USERNAME_RE.match(t.lstrip("@"))]
+
+
+def _is_admin(msg: Message) -> bool:
+    return bool(msg.from_user) and msg.from_user.id in ADMINS
+
+
+@router.message(Command("addfriend"))
+async def add_friend(msg: Message, command: CommandObject, bot: Bot, db: DB):
+    if not _is_admin(msg):
+        return
+    names = _usernames(command)
+    if not names:
+        await safe(msg.answer, "Укажите ник: <code>/addfriend @username</code> (можно несколько через пробел)")
+        return
+    lines = []
+    for u in names:
+        uid = await db.user_id_by_username(u)
+        if uid:
+            await db.set_free(uid, True)
+            lines.append(f"✅ @{esc(u)}: бесплатный доступ включён")
+            await safe(bot.send_message, uid, "🤝 <b>Автор выдал вам бесплатный доступ!</b>",
+                       reply_markup=main_kb(uid))
+        else:
+            await db.add_pending(u)
+            lines.append(f"⏳ @{esc(u)}: бот его ещё не видел. Доступ включится сам, когда он нажмёт /start или подключит бота")
+    await safe(msg.answer, "\n".join(lines))
+
+
+@router.message(Command("delfriend"))
+async def del_friend(msg: Message, command: CommandObject, db: DB):
+    if not _is_admin(msg):
+        return
+    names = _usernames(command)
+    if not names:
+        await safe(msg.answer, "Укажите ник: <code>/delfriend @username</code>")
+        return
+    lines = []
+    for u in names:
+        uid = await db.user_id_by_username(u)
+        removed = await db.del_pending(u)
+        if uid:
+            await db.set_free(uid, False)
+            removed = True
+        lines.append(f"{'🗑' if removed else '❔'} @{esc(u)}: {'доступ снят' if removed else 'в списке не найден'}")
+    await safe(msg.answer, "\n".join(lines))
+
+
+@router.message(Command("friends"))
+async def friends(msg: Message, db: DB):
+    if not _is_admin(msg):
+        return
+    rows, pending = await db.free_list(), await db.pending_list()
+    lines = [f"🤝 {esc(r['name'] or r['user_id'])}" + (f" (@{esc(r['username'])})" if r["username"] else "") for r in rows]
+    lines += [f"⏳ @{esc(u)} (ждёт первого входа)" for u in pending]
+    await safe(msg.answer, "<b>Друзья с бесплатным доступом</b>\n" + ("\n".join(lines) if lines else "Пока никого."))
+
+
+# ---------- tracking users (needed to resolve @username) ----------
+
+class UserTracker(BaseMiddleware):
+    EVENTS = {"message", "callback_query", "business_connection", "pre_checkout_query"}
+
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user and not user.is_bot and getattr(event, "event_type", None) in self.EVENTS:
+            db: DB = data["db"]
+            if await db.touch_user(user.id, user.username, user.full_name, int(time.time())):
+                await safe(
+                    data["bot"].send_message, user.id,
+                    "🤝 <b>Автор выдал вам бесплатный доступ!</b>", reply_markup=main_kb(user.id),
+                )
+        return await handler(event, data)
+
+
+def register_middlewares(dp) -> None:
+    dp.update.outer_middleware(UserTracker())
+
+
+# must stay the LAST message handler: anything else typed to the bot opens the menu
+@router.message(F.text)
+async def fallback(msg: Message, db: DB):
+    await start(msg, db)
