@@ -136,6 +136,21 @@ class DB:
         )
         await self.conn.commit()
 
+    async def users_overview(self):
+        """Everyone who uses the bot itself (not the people they chat with)."""
+        async with self.conn.execute(
+            "WITH ids AS (SELECT user_id FROM users UNION SELECT user_id FROM access "
+            "UNION SELECT user_id FROM connections) "
+            "SELECT i.user_id, u.username, COALESCE(u.name, a.name) AS name, "
+            "COALESCE(u.last_seen, 0) AS last_seen, "
+            "EXISTS(SELECT 1 FROM connections c WHERE c.user_id=i.user_id AND c.is_enabled=1) AS connected, "
+            "COALESCE(a.free, 0) AS free, COALESCE(a.paid_until, 0) AS paid_until, "
+            "COALESCE(a.trial_until, 0) AS trial_until "
+            "FROM ids i LEFT JOIN users u ON u.user_id=i.user_id LEFT JOIN access a ON a.user_id=i.user_id "
+            "ORDER BY last_seen DESC, i.user_id"
+        ) as c:
+            return [dict(r) for r in await c.fetchall()]
+
     async def counts(self) -> dict:
         out = {}
         for t in ("connections", "messages", "users", "payments"):

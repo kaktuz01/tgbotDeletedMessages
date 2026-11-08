@@ -16,11 +16,11 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .backup import send_backup
-from .billing import ADMINS, PLAN_DAYS, PRICE_STARS, TRIAL_DAYS, describe, status
+from .billing import ADMINS, PLAN_DAYS, PRICE_STARS, TRIAL_DAYS, classify, describe, status
 from .db import DB
 from .logsetup import only_problems, read_tail
 from .safe import safe
-from .util import esc, fmt_ts
+from .util import esc, fmt_date, fmt_short, fmt_ts
 
 log = logging.getLogger("bot.ui")
 router = Router()
@@ -399,6 +399,7 @@ async def render_admin(cb: CallbackQuery, db: DB):
     st = await db.stats(int(time.time()))
     friends = await db.free_list()
     kb = InlineKeyboardBuilder()
+    kb.button(text="👥 Пользователи", callback_data="ul:0")
     kb.button(text="📜 Логи: 300 строк", callback_data="lg:300")
     kb.button(text="⚠️ Логи: только ошибки", callback_data="lg:err")
     for f in friends:
@@ -425,6 +426,61 @@ async def admin_view(cb: CallbackQuery, db: DB):
         await safe(cb.answer, "Недостаточно прав", show_alert=True)
         return
     await render_admin(cb, db)
+
+
+USERS_PAGE = 8
+
+
+def _short_status(user_id: int, row: dict, now: int) -> str:
+    _, kind, until = classify(user_id, row["free"], row["paid_until"], row["trial_until"], now)
+    d = fmt_date(until) if until else ""
+    return {
+        "admin": "👑 админ",
+        "free": "🤝 друг",
+        "paid": f"💎 до {d}",
+        "trial": f"🎁 пробный до {d}",
+        "expired": f"⏳ истёк {d}",
+        "none": "➖ без доступа",
+    }[kind]
+
+
+@router.callback_query(F.data.startswith("ul:"))
+async def users_list(cb: CallbackQuery, db: DB):
+    import time
+
+    if cb.from_user.id not in ADMINS:
+        await safe(cb.answer, "Недостаточно прав", show_alert=True)
+        return
+    rows = await db.users_overview()
+    pages = max(1, (len(rows) + USERS_PAGE - 1) // USERS_PAGE)
+    try:
+        page = min(max(int(cb.data[3:]), 0), pages - 1)
+    except ValueError:
+        page = 0
+    now = int(time.time())
+    lines = []
+    for i, r in enumerate(rows[page * USERS_PAGE:(page + 1) * USERS_PAGE], page * USERS_PAGE + 1):
+        who = esc(r["name"] or "без имени") + (f" (@{esc(r['username'])})" if r["username"] else "")
+        lines.append(
+            f"<b>{i}.</b> {who}\n"
+            f"    🆔 <code>{r['user_id']}</code> · {_short_status(r['user_id'], r, now)}\n"
+            f"    {'🔌 подключён' if r['connected'] else '🔌 не подключён'} · был(а): {fmt_short(r['last_seen'])}"
+        )
+    kb = InlineKeyboardBuilder()
+    nav = []
+    if page > 0:
+        nav.append(Btn(text="◀", callback_data=f"ul:{page - 1}"))
+    nav.append(Btn(text=f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(Btn(text="▶", callback_data=f"ul:{page + 1}"))
+    kb.row(*nav)
+    kb.row(Btn(text="◀ Админ", callback_data="adm"))
+    connected = sum(1 for r in rows if r["connected"])
+    text = (
+        f"👥 <b>Пользователи бота</b>: {len(rows)} · подключили: {connected}\n{LINE}\n"
+        + ("\n\n".join(lines) if lines else "Пока никого.")
+    )
+    await show(cb, text, kb.as_markup())
 
 
 @router.callback_query(F.data.startswith("lg:"))

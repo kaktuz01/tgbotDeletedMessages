@@ -21,6 +21,14 @@ def get_tz():
         return timezone.utc
 
 
+def fmt_date(ts: int) -> str:
+    return datetime.fromtimestamp(ts, get_tz()).strftime("%d.%m.%Y")
+
+
+def fmt_short(ts: int) -> str:
+    return datetime.fromtimestamp(ts, get_tz()).strftime("%d.%m %H:%M") if ts else "—"
+
+
 def fmt_ts(ts: int) -> str:
     return datetime.fromtimestamp(ts, get_tz()).strftime("%d.%m.%Y %H:%M:%S")
 

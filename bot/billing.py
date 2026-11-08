@@ -11,6 +11,20 @@ PLAN_DAYS = int(os.getenv("PLAN_DAYS", "30"))
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
 
+def classify(user_id: int, free, paid_until: int, trial_until: int, now: int):
+    """Pure access rule. Returns (active, kind, until); kind: admin|free|paid|trial|expired|none."""
+    if user_id in ADMINS:
+        return True, "admin", 0
+    if free:
+        return True, "free", 0
+    if paid_until > now:
+        return True, "paid", paid_until
+    if trial_until > now:
+        return True, "trial", trial_until
+    last = max(paid_until, trial_until)
+    return (False, "expired", last) if last else (False, "none", 0)
+
+
 async def status(db: DB, user_id: int, now: int | None = None):
     """Return (active, kind, until). kind: admin | paid | trial | expired | none."""
     now = now or int(time.time())
@@ -23,14 +37,7 @@ async def status(db: DB, user_id: int, now: int | None = None):
             a = await db.get_access(user_id)
         else:
             return False, "none", 0
-    if a["free"]:
-        return True, "free", 0
-    if a["paid_until"] > now:
-        return True, "paid", a["paid_until"]
-    if a["trial_until"] > now:
-        return True, "trial", a["trial_until"]
-    last = max(a["paid_until"], a["trial_until"])
-    return (False, "expired", last) if last else (False, "none", 0)
+    return classify(user_id, a["free"], a["paid_until"], a["trial_until"], now)
 
 
 def describe(kind: str, until: int) -> str:
