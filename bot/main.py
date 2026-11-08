@@ -203,7 +203,9 @@ async def on_edited(msg: Message, bot: Bot, db: DB):
 async def notify_deleted(bot: Bot, owner: int, row):
     header = (
         f"🗑 <b>Сообщение удалено</b>\n"
-        f"👤 {esc(row['from_name'])}\n🕒 {fmt_ts(row['date'])}"
+        f"💬 Чат: {esc(row['chat_name'])}\n"
+        f"✍️ Автор: {esc(row['from_name'])}\n"
+        f"🕒 Отправлено: {fmt_ts(row['date'])}"
     )
     markup = quick_ignore_kb(row["chat_id"], False)
     kind, path = row["media_kind"], row["media_path"]
@@ -229,37 +231,51 @@ async def notify_deleted(bot: Bot, owner: int, row):
 @router.deleted_business_messages()
 async def on_deleted(event: BusinessMessagesDeleted, bot: Bot, db: DB):
     cid = event.business_connection_id
+    # Telegram does not say WHO deleted the messages, so log everything we know
+    log.info("deleted_business_messages chat=%s ids=%s", event.chat.id, list(event.message_ids))
     conn = await get_conn(bot, db, cid)
-    if conn is None or await db.is_ignored(conn["user_id"], event.chat.id):
+    if conn is None:
+        log.info("  skipped: unknown or disabled business connection")
+        return
+    if await db.is_ignored(conn["user_id"], event.chat.id):
+        log.info("  skipped: chat is ignored")
         return
     await db.mark_deleted(cid, event.chat.id, event.message_ids)
     s = await db.get_settings(conn["user_id"])
     if not s["notify_deleted"]:
+        log.info("  skipped: deletion notifications are off")
         return
     active = (await status(db, conn["user_id"]))[0]
     missing = hidden = 0
+    found = []
     for mid in event.message_ids:
         try:
             row = await db.get_message(cid, event.chat.id, mid)
             if row is None:
                 missing += 1
-            elif row["from_id"] != conn["user_id"] or s["notify_own"]:
+                continue
+            found.append((mid, row["from_id"] == conn["user_id"]))
+            if row["from_id"] != conn["user_id"] or s["notify_own"]:
                 if active:
                     await notify_deleted(bot, conn["user_chat_id"], row)
                 else:
                     hidden += 1
         except Exception:
             log.exception("failed to notify about deleted message %s", mid)
+    log.info(
+        "  in db: %s (id, own)=%s; not in db: %s; shown_notification=%s",
+        len(found), found, missing, bool(active and s["notify_unknown"]) if missing else "n/a",
+    )
     if hidden:
         await nudge(bot, db, conn, hidden)
-    if missing and active:
+    if missing and active and s["notify_unknown"]:
         await safe(
             bot.send_message,
             conn["user_chat_id"],
             f"🗑 <b>Удалено сообщений: {missing}</b>\n"
-            f"👤 {esc(event.chat.full_name)}\n"
-            "<i>Бот не нашёл их в базе: они могли прийти до подключения, пока бот был выключен "
-            "или чат не входил в список доступных боту.</i>",
+            f"💬 В чате с {esc(event.chat.full_name)}\n"
+            "<i>Кто их удалил, Telegram не сообщает. В базе бота их нет: они могли прийти "
+            "до подключения, пока бот был выключен или чат не входил в список доступных боту.</i>",
             reply_markup=quick_ignore_kb(event.chat.id, False),
         )
 

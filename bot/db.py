@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS settings (
     notify_edited INTEGER NOT NULL DEFAULT 1,
     notify_own INTEGER NOT NULL DEFAULT 0,
     backup_daily INTEGER NOT NULL DEFAULT 0,
-    last_backup INTEGER NOT NULL DEFAULT 0
+    last_backup INTEGER NOT NULL DEFAULT 0,
+    notify_unknown INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS ignored (
     user_id INTEGER NOT NULL,
@@ -75,7 +76,7 @@ CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
 CREATE TABLE IF NOT EXISTS pending_free (username TEXT PRIMARY KEY);
 """
 
-SETTING_FIELDS = ("notify_deleted", "notify_edited", "notify_own", "backup_daily")
+SETTING_FIELDS = ("notify_deleted", "notify_edited", "notify_own", "notify_unknown", "backup_daily")
 
 
 class DB:
@@ -88,11 +89,15 @@ class DB:
         self.conn.row_factory = aiosqlite.Row
         await self.conn.executescript(SCHEMA)
         # migration for databases created before media_file_id existed
-        async with self.conn.execute("PRAGMA table_info(messages)") as c:
-            cols = {r["name"] for r in await c.fetchall()}
-        if "media_file_id" not in cols:
-            await self.conn.execute("ALTER TABLE messages ADD COLUMN media_file_id TEXT")
+        await self._ensure_column("messages", "media_file_id", "TEXT")
+        await self._ensure_column("settings", "notify_unknown", "INTEGER NOT NULL DEFAULT 0")
         await self.conn.commit()
+
+    async def _ensure_column(self, table: str, column: str, ddl: str):
+        async with self.conn.execute(f"PRAGMA table_info({table})") as c:
+            cols = {r["name"] for r in await c.fetchall()}
+        if column not in cols:
+            await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     async def close(self):
         if self.conn:

@@ -64,6 +64,7 @@ SETTING_LABELS = {
     "notify_deleted": "Уведомлять об удалённых",
     "notify_edited": "Уведомлять об изменённых",
     "notify_own": "Также про мои сообщения",
+    "notify_unknown": "Удаления, которых нет в базе",
     "backup_daily": "Ежедневный бэкап базы",
 }
 
