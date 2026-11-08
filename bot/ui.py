@@ -18,6 +18,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from .backup import send_backup
 from .billing import ADMINS, PLAN_DAYS, PRICE_STARS, TRIAL_DAYS, describe, status
 from .db import DB
+from .logsetup import only_problems, read_tail
 from .safe import safe
 from .util import esc, fmt_ts
 
@@ -398,6 +399,8 @@ async def render_admin(cb: CallbackQuery, db: DB):
     st = await db.stats(int(time.time()))
     friends = await db.free_list()
     kb = InlineKeyboardBuilder()
+    kb.button(text="📜 Логи: 300 строк", callback_data="lg:300")
+    kb.button(text="⚠️ Логи: только ошибки", callback_data="lg:err")
     for f in friends:
         kb.button(text=f"❌ {(f['name'] or str(f['user_id']))[:30]}", callback_data=f"fd:{f['user_id']}")
     kb.button(text="🏠 Меню", callback_data="m")
@@ -422,6 +425,26 @@ async def admin_view(cb: CallbackQuery, db: DB):
         await safe(cb.answer, "Недостаточно прав", show_alert=True)
         return
     await render_admin(cb, db)
+
+
+@router.callback_query(F.data.startswith("lg:"))
+async def send_logs(cb: CallbackQuery):
+    if cb.from_user.id not in ADMINS:  # admin-only, checked again on every press
+        await safe(cb.answer, "Недостаточно прав", show_alert=True)
+        return
+    mode = cb.data[3:]
+    if mode == "err":
+        lines, name = only_problems(read_tail(3000))[-300:], "bot_errors.txt"
+    elif mode in ("100", "300", "1000"):
+        lines, name = read_tail(int(mode)), f"bot_log_{mode}.txt"
+    else:
+        await safe(cb.answer)
+        return
+    if not lines or not isinstance(cb.message, Message):
+        await safe(cb.answer, "В логе пока ничего нет" if not lines else None, show_alert=bool(not lines))
+        return
+    await safe(cb.message.answer_document, BufferedInputFile("\n".join(lines).encode(), filename=name))
+    await safe(cb.answer)
 
 
 @router.callback_query(F.data.startswith("fd:"))
