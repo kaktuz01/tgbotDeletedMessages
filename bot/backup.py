@@ -14,6 +14,7 @@ from aiogram.types import FSInputFile
 from .billing import status
 from .db import DB
 from .safe import safe
+from .util import get_tz
 
 log = logging.getLogger("bot.backup")
 TG_LIMIT = 49 * 1024 * 1024
@@ -39,7 +40,7 @@ def _make_user_backup(db_path: str, user_id: int, out_dir: str) -> str:
         c.execute("VACUUM")
     finally:
         c.close()
-    out = Path(out_dir) / f"backup_{datetime.now():%Y%m%d_%H%M}.db.gz"
+    out = Path(out_dir) / f"backup_{datetime.now(get_tz()):%Y%m%d_%H%M}.db.gz"
     with open(tmp, "rb") as f_in, gzip.open(out, "wb") as f_out:
         shutil.copyfileobj(f_in, f_out)
     tmp.unlink()

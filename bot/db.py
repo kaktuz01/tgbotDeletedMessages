@@ -136,6 +136,13 @@ class DB:
         )
         await self.conn.commit()
 
+    async def counts(self) -> dict:
+        out = {}
+        for t in ("connections", "messages", "users", "payments"):
+            async with self.conn.execute(f"SELECT COUNT(*) FROM {t}") as c:
+                out[t] = (await c.fetchone())[0]
+        return out
+
     async def set_media_path(self, cid, chat_id, message_id, path):
         await self.conn.execute(
             "UPDATE messages SET media_path=? WHERE connection_id=? AND chat_id=? AND message_id=?",

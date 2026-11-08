@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from .backup import backup_loop
 from .billing import ADMINS, TRIAL_DAYS, describe, status
 from .db import DB
+from .logsetup import log_startup, setup_logging
 from .safe import safe
 from .ui import quick_ignore_kb, sub_kb
 from .ui import register_middlewares
@@ -286,7 +287,7 @@ async def on_error(event: ErrorEvent):
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    setup_logging()
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise SystemExit("Задайте BOT_TOKEN в .env")
@@ -296,6 +297,7 @@ async def main():
     db = DB(db_path)
     await db.open()
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    await log_startup(bot, db, MEDIA_DIR)
     dp = Dispatcher(db=db)
     dp.include_router(router)
     dp.include_router(ui_router)
