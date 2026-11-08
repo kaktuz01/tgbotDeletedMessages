@@ -7,6 +7,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
@@ -48,40 +49,71 @@ DEFAULT_EXT = {
 }
 
 
+DOWNLOAD_LIMIT = 20 * 1024 * 1024  # Bot API cannot download bigger files
+_downloads = asyncio.Semaphore(3)
+_bg_tasks: set[asyncio.Task] = set()
+
+
 def extract_media(msg: Message):
+    """(kind, file_id, extension, size) of the attached media, or Nones."""
     if msg.photo:
-        return "photo", msg.photo[-1].file_id, ".jpg"
+        p = msg.photo[-1]
+        return "photo", p.file_id, ".jpg", p.file_size
     for kind in ("video", "voice", "video_note", "audio", "animation", "sticker", "document"):
         obj = getattr(msg, kind)
         if obj:
             name = getattr(obj, "file_name", None)
-            return kind, obj.file_id, (Path(name).suffix if name else DEFAULT_EXT.get(kind, ""))
-    return None, None, None
+            ext = Path(name).suffix if name else DEFAULT_EXT.get(kind, "")
+            return kind, obj.file_id, ext, getattr(obj, "file_size", None)
+    return None, None, None, None
+
+
+async def download_media(bot: Bot, db: DB, key: tuple, file_id: str, dest: Path):
+    """Background download; never blocks saving the message itself."""
+    async with _downloads:
+        for attempt in range(3):
+            try:
+                await bot.download(file_id, destination=dest, timeout=120)
+                await db.set_media_path(*key, str(dest))
+                return
+            except TelegramBadRequest as e:  # too big / expired: retrying is pointless
+                log.warning("media download skipped: %s", e)
+                return
+            except Exception as e:
+                log.warning("media download failed (attempt %s/3): %s", attempt + 1, e)
+                await asyncio.sleep(2 ** attempt)
 
 
 async def store(bot: Bot, db: DB, msg: Message):
-    kind, file_id, ext = extract_media(msg)
-    path = None
-    if file_id:
-        dest = MEDIA_DIR / str(msg.chat.id) / f"{msg.message_id}{ext}"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            await bot.download(file_id, destination=dest)
-            path = str(dest)
-        except Exception as e:  # file > 20 MB, expired, network...
-            log.warning("media download failed: %s", e)
+    kind, file_id, ext, size = extract_media(msg)
+    cid, chat_id, mid = msg.business_connection_id, msg.chat.id, msg.message_id
+    old = await db.get_message(cid, chat_id, mid) if file_id else None
+    # the message goes to the DB FIRST: a quick deletion must always find it
     await db.save_message(
-        connection_id=msg.business_connection_id,
-        chat_id=msg.chat.id,
-        message_id=msg.message_id,
-        chat_name=msg.chat.full_name or msg.chat.title or str(msg.chat.id),
+        connection_id=cid,
+        chat_id=chat_id,
+        message_id=mid,
+        chat_name=msg.chat.full_name or msg.chat.title or str(chat_id),
         from_id=msg.from_user.id if msg.from_user else None,
         from_name=full_name(msg.from_user),
         date=int(msg.date.timestamp()),
         text=msg.text or msg.caption,
         media_kind=kind,
-        media_path=path,
+        media_path=None,
+        media_file_id=file_id,
     )
+    if not file_id:
+        return
+    if size and size > DOWNLOAD_LIMIT:
+        log.info("media too big to download (%s bytes); will resend by file_id", size)
+        return
+    if old and old["media_file_id"] == file_id and old["media_path"] and Path(old["media_path"]).exists():
+        return  # already downloaded (e.g. text edit of a media message)
+    dest = MEDIA_DIR / str(chat_id) / f"{mid}{ext}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    task = asyncio.create_task(download_media(bot, db, (cid, chat_id, mid), file_id, dest))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 async def get_conn(bot: Bot, db: DB, cid: str):
@@ -176,14 +208,19 @@ async def notify_deleted(bot: Bot, owner: int, row):
     markup = quick_ignore_kb(row["chat_id"], False)
     kind, path = row["media_kind"], row["media_path"]
     sender = MEDIA.get(kind)
-    if sender and path and Path(path).exists():
+    # prefer the local copy; if it is not downloaded (yet), resend by Telegram file_id
+    if path and Path(path).exists():
+        src = FSInputFile(path)
+    else:
+        src = row["media_file_id"]
+    if sender and src:
         if kind in ("video_note", "sticker"):
             await safe(bot.send_message, owner, header, reply_markup=markup)
-            if await safe(getattr(bot, sender), owner, FSInputFile(path)) is None:
+            if await safe(getattr(bot, sender), owner, src) is None:
                 await safe(bot.send_message, owner, "⚠️ Не удалось отправить файл.")
             return
         caption = header + (f"\n\n{quote(row['text'], 700)}" if row["text"] else "")
-        if await safe(getattr(bot, sender), owner, FSInputFile(path), caption=caption, reply_markup=markup):
+        if await safe(getattr(bot, sender), owner, src, caption=caption, reply_markup=markup):
             return
     body = f"\n\n{quote(row['text'], 3000)}" if row["text"] else f"\n\n<i>[{esc(kind or 'нет текста')}]</i>"
     await safe(bot.send_message, owner, header + body, reply_markup=markup)
@@ -221,7 +258,8 @@ async def on_deleted(event: BusinessMessagesDeleted, bot: Bot, db: DB):
             conn["user_chat_id"],
             f"🗑 <b>Удалено сообщений: {missing}</b>\n"
             f"👤 {esc(event.chat.full_name)}\n"
-            "<i>Бот не успел их сохранить: они пришли до подключения.</i>",
+            "<i>Бот не нашёл их в базе: они могли прийти до подключения, пока бот был выключен "
+            "или чат не входил в список доступных боту.</i>",
             reply_markup=quick_ignore_kb(event.chat.id, False),
         )
 

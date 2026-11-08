@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS messages (
     text TEXT,
     media_kind TEXT,
     media_path TEXT,
+    media_file_id TEXT,
     edited INTEGER NOT NULL DEFAULT 0,
     deleted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (connection_id, chat_id, message_id)
@@ -86,6 +87,11 @@ class DB:
         self.conn = await aiosqlite.connect(self.path)
         self.conn.row_factory = aiosqlite.Row
         await self.conn.executescript(SCHEMA)
+        # migration for databases created before media_file_id existed
+        async with self.conn.execute("PRAGMA table_info(messages)") as c:
+            cols = {r["name"] for r in await c.fetchall()}
+        if "media_file_id" not in cols:
+            await self.conn.execute("ALTER TABLE messages ADD COLUMN media_file_id TEXT")
         await self.conn.commit()
 
     async def close(self):
@@ -109,14 +115,26 @@ class DB:
             return await c.fetchall()
 
     async def save_message(self, **m):
+        m.setdefault("media_file_id", None)
         await self.conn.execute(
             "INSERT INTO messages (connection_id, chat_id, message_id, chat_name, from_id, from_name, "
-            "date, text, media_kind, media_path) VALUES "
-            "(:connection_id,:chat_id,:message_id,:chat_name,:from_id,:from_name,:date,:text,:media_kind,:media_path) "
+            "date, text, media_kind, media_path, media_file_id) VALUES "
+            "(:connection_id,:chat_id,:message_id,:chat_name,:from_id,:from_name,:date,:text,"
+            ":media_kind,:media_path,:media_file_id) "
             "ON CONFLICT(connection_id, chat_id, message_id) DO UPDATE SET "
             "text=excluded.text, media_kind=excluded.media_kind, "
-            "media_path=COALESCE(excluded.media_path, media_path)",
+            # keep the downloaded file unless the message now carries a different file
+            "media_path=CASE WHEN excluded.media_file_id IS media_file_id "
+            "THEN media_path ELSE excluded.media_path END, "
+            "media_file_id=COALESCE(excluded.media_file_id, media_file_id)",
             m,
+        )
+        await self.conn.commit()
+
+    async def set_media_path(self, cid, chat_id, message_id, path):
+        await self.conn.execute(
+            "UPDATE messages SET media_path=? WHERE connection_id=? AND chat_id=? AND message_id=?",
+            (path, cid, chat_id, message_id),
         )
         await self.conn.commit()
 
